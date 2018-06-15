@@ -111,7 +111,9 @@ func New(n *node.Node, s conns.Session) (conns.ClientConn, error) {
 	}
 	go c.sendMessages()
 	if staleCloseDelay > 0 {
+		c.Lock()
 		c.staleTimer = time.AfterFunc(staleCloseDelay, c.closeUnauthenticated)
+		c.Unlock()
 	}
 	return &c, nil
 }
@@ -157,38 +159,35 @@ func (c *client) closeUnauthenticated() {
 
 // updateChannelPresence updates client presence info for channel so it
 // won't expire until client disconnect
-func (c *client) updateChannelPresence(ch string) {
+func (c *client) updateChannelPresence(ch string) error {
 	chOpts, err := c.node.ChannelOpts(ch)
 	if err != nil {
-		return
+		return err
 	}
 	if !chOpts.Presence {
-		return
+		return nil
 	}
-	c.node.AddPresence(ch, c.uid, c.info(ch))
+	return c.node.AddPresence(ch, c.uid, c.info(ch))
 }
 
 // updatePresence updates presence info for all client channels
 func (c *client) updatePresence() {
-	c.RLock()
+	c.Lock()
+	defer c.Unlock()
 	if c.closed {
-		c.RUnlock()
 		return
 	}
-	for _, channel := range c.Channels() {
-		c.updateChannelPresence(channel)
+	for ch := range c.channels {
+		err := c.updateChannelPresence(ch)
+		if err != nil {
+			logger.ERROR.Printf("error updating presence for channel %s: %v", ch, err)
+		}
 	}
-	c.RUnlock()
-	c.Lock()
 	c.addPresenceUpdate()
-	c.Unlock()
 }
 
 // Lock must be held outside.
 func (c *client) addPresenceUpdate() {
-	if c.closed {
-		return
-	}
 	config := c.node.Config()
 	presenceInterval := config.PresencePingInterval
 	c.presenceTimer = time.AfterFunc(presenceInterval, c.updatePresence)
@@ -331,7 +330,7 @@ func (c *client) Handle(msg []byte) error {
 		c.Close(&conns.DisconnectAdvice{Reason: proto.ErrInvalidMessage.Error(), Reconnect: false})
 		return proto.ErrInvalidMessage
 	} else if len(msg) > c.maxRequestSize {
-		logger.ERROR.Println("client request exceeds max request size limit")
+		logger.ERROR.Printf("client request exceeds max request size limit, client: %s", c.uid)
 		c.Close(&conns.DisconnectAdvice{Reason: proto.ErrLimitExceeded.Error(), Reconnect: false})
 		return proto.ErrLimitExceeded
 	}
@@ -587,6 +586,8 @@ func (c *client) connectCmd(cmd *proto.ConnectClientCommand) (proto.Response, er
 	}
 
 	c.authenticated = true
+	logger.DEBUG.Printf("client %s authenticated as user %s", c.uid, c.user)
+
 	if len(info) > 0 {
 		c.defaultInfo = raw.Raw(info)
 	}
@@ -628,7 +629,7 @@ func (c *client) refreshCmd(cmd *proto.RefreshClientCommand) (proto.Response, er
 
 	isValid := auth.CheckClientToken(secret, string(user), timestamp, info, token)
 	if !isValid {
-		logger.ERROR.Println("invalid refresh token for user", user)
+		logger.ERROR.Printf("invalid refresh token for user: %s, client: %s", user, c.uid)
 		return nil, proto.ErrInvalidToken
 	}
 
@@ -654,7 +655,9 @@ func (c *client) refreshCmd(cmd *proto.RefreshClientCommand) (proto.Response, er
 		if timeToExpire > 0 {
 			// connection refreshed, update client timestamp and set new expiration timeout
 			c.timestamp = int64(ts)
-			c.defaultInfo = raw.Raw(info)
+			if len(info) > 0 {
+				c.defaultInfo = raw.Raw(info)
+			}
 			if c.expireTimer != nil {
 				c.expireTimer.Stop()
 			}
@@ -718,14 +721,14 @@ func (c *client) subscribeCmd(cmd *proto.SubscribeClientCommand) (proto.Response
 	}
 
 	if len(channel) > maxChannelLength {
-		logger.ERROR.Printf("channel too long: max %d, got %d", maxChannelLength, len(channel))
+		logger.ERROR.Printf("channel too long: max %d, got %d, user: %s, client: %s", maxChannelLength, len(channel), c.user, c.uid)
 		resp := proto.NewClientSubscribeResponse(body)
 		resp.SetErr(proto.ResponseError{proto.ErrLimitExceeded, proto.ErrorAdviceFix})
 		return resp, nil
 	}
 
 	if len(c.channels) >= channelLimit {
-		logger.ERROR.Printf("maximum limit of channels per client reached: %d", channelLimit)
+		logger.ERROR.Printf("maximum limit of channels per client reached: %d, user: %s, client: %s", channelLimit, c.user, c.uid)
 		resp := proto.NewClientSubscribeResponse(body)
 		resp.SetErr(proto.ResponseError{proto.ErrLimitExceeded, proto.ErrorAdviceFix})
 		return resp, nil
